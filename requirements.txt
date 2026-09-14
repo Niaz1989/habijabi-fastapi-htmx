@@ -1,0 +1,10 @@
+fastapi
+uvicorn
+pydantic
+sqlalchemy
+pymysql
+pwdlib
+cryptography
+python-multipart
+pyjwt
+jinja2
