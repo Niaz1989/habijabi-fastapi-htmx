@@ -1,4 +1,5 @@
 import os
+import re
 from fastapi import FastAPI, HTTPException,Depends,Request,status,Response
 from sqlalchemy.orm import Session,sessionmaker
 from sqlalchemy import String, Integer, Column,Float,create_engine
@@ -348,7 +349,16 @@ async def amil_1(
             এই নামে ইউজার আগে থেকেই আছে!
         </div>
         """
+ # 🚀 --- নতুন পাসওয়ার্ড ভ্যালিডেশন লেয়ার ---
+ # শর্তসমূহ: নুন্যতম ৮ অক্ষর, কমপক্ষে ১টি বড় হাতের অক্ষর, ১টি ছোট হাতের অক্ষর এবং ১টি সংখ্যা থাকতে হবে
+    password_regex = r"^(?=.*[a-z])(?=.*[A-Z])(?=.*\d)[a-zA-Z\d]{8,}$"
 
+    if not re.match(password_regex, password):
+         return """
+            <div class="p-4 mb-4 text-sm text-red-800 bg-red-50 rounded-lg border border-red-200">
+                পাসওয়ার্ডটি যথেষ্ট শক্তিশালী নয়! পাসওয়ার্ডে নুন্যতম ৮টি অক্ষর, ১টি বড় হাতের অক্ষর (A-Z), ১টি ছোট হাতের অক্ষর (a-z) এবং ১টি সংখ্যা (0-9) থাকতে হবে।
+            </div>
+            """
     pic_filename = None
 
     # ২. প্রোফাইল পিকচার ফাইল ভ্যালিডেশন লেয়ার
