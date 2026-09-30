@@ -4,3 +4,4 @@ __pycache__/
 .idea/
 *.pyc
 venv/
+frontend/static/uploads/

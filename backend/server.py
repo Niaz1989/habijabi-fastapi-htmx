@@ -9,10 +9,11 @@ from pwdlib import PasswordHash
 from datetime import datetime, timedelta, timezone
 import jwt
 from fastapi.responses import HTMLResponse
-from fastapi.responses import PlainTextResponse
+from fastapi.responses import PlainTextResponse,RedirectResponse
 import shutil
 from fastapi import File, UploadFile
 from fastapi.staticfiles import StaticFiles
+from math import ceil
 
 
 app = FastAPI()
@@ -130,8 +131,7 @@ async def login(response: Response, request: Request, db: Session = Depends(get_
 
 
 @app.get("/logout")
-async def logout(response: Response):
-    response.delete_cookie("access_token")
+async def logout():
     resp = PlainTextResponse(content="", status_code=200)
     resp.delete_cookie("access_token")   # delete cookie must be set on the actual response returned
     resp.headers["HX-Redirect"] = "/"
@@ -140,47 +140,87 @@ async def logout(response: Response):
 
 # ড্যাশবোর্ড রাউট: সব ইউজারের তালিকা তুলে এনে পেজে পাঠানো
 
+
 @app.get("/dashboard", response_class=HTMLResponse)
-async def dashboard(request: Request, db: Session = Depends(get_db)):
-    # ১. ব্রাউজার কুকি থেকে টোকেন চেক এবং ইউজার ডেটা ডিকোড
+async def dashboard(
+        request: Request,
+        db: Session = Depends(get_db),
+        search: str = "",
+        role_filter: str = "",
+        page: int = 1,
+        limit: int = 5
+):
+    # ১. ব্রাউজার কুকি থেকে টোকেন চেক
     token = request.cookies.get("access_token")
+
+    # কুকি না থাকলে সরাসরি লগইন পেজে রিডাইরেক্ট করা হচ্ছে
     if not token:
-        return HTMLResponse(content="<script>window.location.href='/';</script>")
+        if request.headers.get("HX-Request"):
+            resp = PlainTextResponse(content="", status_code=200)
+            resp.headers["HX-Redirect"] = "/"
+            return resp
+        return RedirectResponse(url="/", status_code=302)
 
     try:
         payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
-        print("DEBUG:", payload)
-        current_user = {
-            "user_name": payload.get("sub"),
-            "user_id": payload.get("user_id"),
-            "role": payload.get("role", "user")
-        }
+        db.expire_all()
+        current_user = db.query(UserTable).filter(UserTable.id == payload.get("user_id")).first()
+
+        # যদি টোকেন ভ্যালিড কিন্তু ডেটাবেজে ইউজার না থাকে
+        if not current_user:
+            raise jwt.PyJWTError
+
     except jwt.PyJWTError:
-        return HTMLResponse(content="<script>window.location.href='/';</script>")
+        # টোকেন এরর হলে কুকি মুছে লগইন পেজে রিডাইরেক্ট
+        if request.headers.get("HX-Request"):
+            resp = PlainTextResponse(content="", status_code=200)
+            resp.delete_cookie("access_token")
+            resp.headers["HX-Redirect"] = "/"
+            return resp
 
-    # ২. ডেটাবেজ থেকে ফ্রেশ ইউজার লিস্ট তুলে আনা
-    db.expire_all()
-    db_users = db.query(UserTable).all()
+        resp = RedirectResponse(url="/", status_code=302)
+        resp.delete_cookie("access_token")
+        return resp
 
-    # ৩. জিংজা টেমপ্লেটের জন্য অবজেক্টগুলোকে খাঁটি পাইথন ডিকশনারিতে রূপান্তর (ম্যাজিক ট্রিক)
+    # ২. অ্যাডমিনদের জন্য সার্চ, ফিল্টার এবং পেজিনেশন কুয়েরি (আগের লজিক ঠিক থাকবে)
     formatted_users = []
-    for u in db_users:
-        formatted_users.append({
-            "id": u.id,
-            "name": u.name,
-            "age": u.age,
-            "height": u.height,
-            "weight": u.weight,
-            "role": u.role,
-            "profile_pic": u.profile_pic
-        })
+    total_pages = 1
 
-    # ৪. কনটেক্সটে ফ্রেশ লিস্টটি পাস করা
-    return templates.TemplateResponse("dashboard.html", {
+    if current_user.role == "admin":
+        query = db.query(UserTable)
+        if search:
+            query = query.filter(UserTable.name.ilike(f"%{search}%"))
+        if role_filter:
+            query = query.filter(UserTable.role == role_filter)
+
+        total_users = query.count()
+        total_pages = ceil(total_users / limit) if total_users > 0 else 1
+
+        offset = (page - 1) * limit
+        db_users = query.offset(offset).limit(limit).all()
+
+        for u in db_users:
+            formatted_users.append({
+                "id": u.id, "name": u.name, "age": u.age,
+                "height": u.height, "weight": u.weight,
+                "role": u.role, "profile_pic": u.profile_pic
+            })
+
+    # ৩. কনটেক্সট তৈরি এবং রেসপন্স পাঠানো
+    context = {
         "request": request,
         "user": current_user,
-        "users": formatted_users  # খাঁটি পাইথন লিস্ট পাঠানো হলো
-    })
+        "users": formatted_users,
+        "search": search,
+        "role_filter": role_filter,
+        "page": page,
+        "total_pages": total_pages
+    }
+
+    if request.headers.get("HX-Request"):
+        return templates.TemplateResponse("partials/table_body.html", context)
+
+    return templates.TemplateResponse("dashboard.html", context)
 
 
 # --- ১. ইউজার ডিলিট করার এন্ডপয়েন্ট (HTMX Delete) ---
@@ -280,6 +320,13 @@ os.makedirs(UPLOAD_DIR, exist_ok=True)
 app.mount("/static", StaticFiles(directory=os.path.join(BASE_DIR, "frontend", "static")), name="static")
 
 
+
+# ছবির সর্বোচ্চ সাইজ ২ মেগাবাইট (2 MB = 2 * 1024 * 1024 বাইট)
+MAX_FILE_SIZE = 2 * 1024 * 1024
+# শুধুমাত্র নির্দিষ্ট ইমেজ ফরম্যাট অ্যালাউ করা হলো
+ALLOWED_EXTENSIONS = {"image/jpeg", "image/png", "image/webp"}
+
+
 @app.post("/amil", response_class=HTMLResponse)
 async def amil_1(
         request: Request,
@@ -287,27 +334,58 @@ async def amil_1(
         profile_pic: UploadFile = File(None)
 ):
     print("DEBUG profile_pic:", profile_pic, profile_pic.filename if profile_pic else None)
+
+    # ফর্মের টেক্সট ডেটা রিসিভ করা
     form_data = await request.form()
     name = form_data.get("name").strip()
     password = form_data.get("password").strip()
 
+    # ১. ডেটাবেজে ডুপ্লিকেট ইউজার চেক
     existing = db.query(UserTable).filter(UserTable.name == name).first()
     if existing:
         return """
-          <div class="p-4 mb-4 text-sm text-red-800 bg-red-50 rounded-lg border border-red-200">
-              এই নামে ইউজার আগে থেকেই আছে!
-          </div>
-          """
+        <div class="p-4 mb-4 text-sm text-red-800 bg-red-50 rounded-lg border border-red-200">
+            এই নামে ইউজার আগে থেকেই আছে!
+        </div>
+        """
 
     pic_filename = None
+
+    # ২. প্রোফাইল পিকচার ফাইল ভ্যালিডেশন লেয়ার
     if profile_pic and profile_pic.filename:
+
+        # ক) ফাইল ফরম্যাট বা মিমি-টাইপ (Mime-type) চেক
+        if profile_pic.content_type not in ALLOWED_EXTENSIONS:
+            return """
+            <div class="p-4 mb-4 text-sm text-red-800 bg-red-50 rounded-lg border border-red-200">
+                ভুল ফাইল ফরম্যাট! শুধুমাত্র JPG, PNG এবং WEBP ছবি আপলোড করা যাবে।
+            </div>
+            """
+
+        # খ) ফাইলের সাইজ চেক (Max 2MB)
+        # ফাইল পয়েন্টারকে একদম শেষে নিয়ে সাইজ মাপা
+        profile_pic.file.seek(0, 2)
+        file_size = profile_pic.file.tell()
+        # মাপা শেষ করে ফাইল পয়েন্টারকে আবার শুরুতে ফেরত আনা বাধ্যতামূলক
+        profile_pic.file.seek(0)
+
+        if file_size > MAX_FILE_SIZE:
+            return """
+            <div class="p-4 mb-4 text-sm text-red-800 bg-red-50 rounded-lg border border-red-200">
+                ছবির সাইজ অনেক বড়! সর্বোচ্চ ২ মেগাবাইট (2MB) সাইজের ছবি আপলোড করুন।
+            </div>
+            """
+
+        # গ) ভ্যালিডেশন পাস করলে ইউনিক নামে ছবি সার্ভারে সেভ করা
         pic_filename = f"{int(datetime.now().timestamp())}_{profile_pic.filename}"
         file_path = os.path.join(UPLOAD_DIR, pic_filename)
         with open(file_path, "wb") as buffer:
             shutil.copyfileobj(profile_pic.file, buffer)
 
+    # ৩. পাসওয়ার্ড হ্যাশিং
     hashed_password = password_hash.hash(password)
 
+    # ৪. ডাটাবেজ অবজেক্ট তৈরি এবং সেভ
     db_user = UserTable(
         name=name,
         age=int(form_data.get("age")),
@@ -321,9 +399,71 @@ async def amil_1(
     db.commit()
     db.refresh(db_user)
 
+    # ৫. সফলতার মেসেজসহ জিংজা টেমপ্লেট রেসপন্স রিটার্ন
     return templates.TemplateResponse("success_msg.html", {"request": request, "user": db_user})
 
 
+@app.get("/amil/user-edit/{user_id}", response_class=HTMLResponse)
+async def user_edit_form(user_id: int, db: Session = Depends(get_db)):
+    user = db.query(UserTable).filter(UserTable.id == user_id).first()
+    if not user: return "ইউজার পাওয়া যায়নি"
+
+    # এখানে পুরো প্রোফাইল কার্ডটি ইনপুট ফর্মে রূপান্তরিত হয়ে রিটার্ন হবে
+    return f"""
+    <div id="user-profile-card" class="bg-white p-8 rounded-lg shadow-md max-w-2xl w-full">
+        <h2 class="text-xl font-bold text-gray-700 mb-6 border-b pb-2 text-center">প্রোফাইল এডিট করুন</h2>
+        <div class="space-y-4">
+            <div><label class="text-xs font-semibold text-gray-600">নাম:</label><input type="text" name="name" value="{user.name}" class="border rounded p-2 text-sm w-full text-black"></div>
+            <div><label class="text-xs font-semibold text-gray-600">বয়স:</label><input type="number" name="age" value="{user.age}" class="border rounded p-2 text-sm w-full text-black"></div>
+            <div><label class="text-xs font-semibold text-gray-600">উচ্চতা (cm):</label><input type="number" step="0.1" name="height" value="{user.height}" class="border rounded p-2 text-sm w-full text-black"></div>
+            <div><label class="text-xs font-semibold text-gray-600">ওজন (kg):</label><input type="number" step="0.1" name="weight" value="{user.weight}" class="border rounded p-2 text-sm w-full text-black"></div>
+
+            <div class="flex gap-2 justify-end mt-4">
+                <button hx-put="/amil/user-update/{user.id}" hx-target="#user-profile-card" hx-swap="outerHTML" hx-include="#user-profile-card input" class="bg-green-600 text-white px-4 py-1.5 rounded text-xs hover:bg-green-700 font-semibold cursor-pointer">Save</button>
+                <button hx-get="/dashboard" hx-target="body" class="bg-gray-500 text-white px-4 py-1.5 rounded text-xs hover:bg-gray-600 font-semibold cursor-pointer">Cancel</button>
+            </div>
+        </div>
+    </div>
+    """
 
 
+@app.put("/amil/user-update/{user_id}", response_class=HTMLResponse)
+async def user_update_submit(user_id: int, request: Request, db: Session = Depends(get_db)):
+    form_data = await request.form()
+    user = db.query(UserTable).filter(UserTable.id == user_id).first()
+    if not user: raise HTTPException(status_code=404, detail="User not found")
+
+    # ডাটাবেজ আপডেট
+    user.name = form_data.get("name")
+    user.age = int(form_data.get("age"))
+    user.height = float(form_data.get("height"))
+    user.weight = float(form_data.get("weight"))
+    db.commit()
+    db.refresh(user)
+
+    # আপডেট শেষে আবার সাধারণ প্রোফাইল কার্ডটি রিটার্ন করা (যা আগের রূপেই ফিরে যাবে)
+    pic_html = f'<img src="{user.profile_pic}" class="w-24 h-24 rounded-full object-cover border-4 border-blue-100 shadow">' if user.profile_pic else '<div class="w-24 h-24 rounded-full bg-gray-300 flex items-center justify-center text-sm text-white font-bold shadow">No Pic</div>'
+
+    return f"""
+    <div id="user-profile-card" class="bg-white p-8 rounded-lg shadow-md max-w-2xl w-full">
+        <h2 class="text-xl font-bold text-gray-700 mb-6 border-b pb-2 text-center">আপনার প্রোফাইল তথ্য</h2>
+        <div class="flex flex-col items-center sm:flex-row sm:justify-around gap-6">
+            <div class="flex flex-col items-center">
+                {pic_html}
+                <p class="mt-3 font-semibold text-gray-800 text-lg">{user.name}</p>
+            </div>
+            <div class="w-full sm:w-auto bg-gray-50 p-4 rounded-lg border border-gray-100 flex-1">
+                <table class="w-full text-left text-sm text-gray-600">
+                    <tr class="border-b"><td class="py-2 font-medium text-gray-500">ইউজার ID:</td><td class="py-2 pl-4 text-gray-900 font-semibold">{user.id}</td></tr>
+                    <tr class="border-b"><td class="py-2 font-medium text-gray-500">বয়স:</td><td class="py-2 pl-4 text-gray-900">{user.age} বছর</td></tr>
+                    <tr class="border-b"><td class="py-2 font-medium text-gray-500">উচ্চতা:</td><td class="py-2 pl-4 text-gray-900">{user.height} cm</td></tr>
+                    <tr class="border-b"><td class="py-2 font-medium text-gray-500">ওজন:</td><td class="py-2 pl-4 text-gray-900">{user.weight} kg</td></tr>
+                </table>
+                <div class="mt-4 text-right">
+                    <button hx-get="/amil/user-edit/{user.id}" hx-target="#user-profile-card" hx-swap="outerHTML" class="bg-blue-600 text-white px-4 py-1.5 rounded text-xs hover:bg-blue-700 font-semibold cursor-pointer">Edit Profile</button>
+                </div>
+            </div>
+        </div>
+    </div>
+    """
 
